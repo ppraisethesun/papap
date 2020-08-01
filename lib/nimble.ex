@@ -3,22 +3,26 @@ defmodule Nimble do
 
   defmodule Base do
     def ignore_ws(combinator) do
-      ignore(combinator, choice([repeat(ascii_char([?\s])), empty()])) |> label("whitespace")
+      ignore(combinator, choice([repeat(ascii_char([?\s])), empty()]) |> label("whitespace"))
     end
   end
 
   opening_bracket = string("(") |> byte_offset() |> Base.ignore_ws() |> label("opening bracket")
   closing_bracket = string(")") |> byte_offset() |> Base.ignore_ws() |> label("closing bracket")
 
-  add_sub = utf8_string([?+, ?-], 1) |> Base.ignore_ws() |> label("operator")
-  mul_div = utf8_string([?*, ?/], 1) |> Base.ignore_ws() |> label("operator")
+  func_opening_bracket =
+    string("{") |> byte_offset() |> label("function opening bracket") |> Base.ignore_ws()
 
-  func_opening_bracket = string("{") |> Base.ignore_ws() |> label("function opening bracket")
-  func_closing_bracket = string("}") |> Base.ignore_ws() |> label("function closing bracket")
+  func_closing_bracket =
+    string("}") |> byte_offset() |> label("function closing bracket") |> Base.ignore_ws()
+
   func_args_separator = string(",") |> Base.ignore_ws() |> label("args separator")
 
   any_operator = utf8_string([?+, ?-, ?*, ?/, ?<, ?>, ?=], min: 1) |> label("any operator")
   any_closing_bracket = utf8_string([?), ?}], min: 1) |> label("any closing bracket")
+
+  add_sub = utf8_string([?+, ?-], 1) |> Base.ignore_ws() |> label("operator")
+  mul_div = utf8_string([?*, ?/], 1) |> Base.ignore_ws() |> label("operator")
 
   integer =
     integer(min: 1)
@@ -74,10 +78,37 @@ defmodule Nimble do
     |> ignore(func_opening_bracket)
     |> concat(optional(func_call_args))
     |> ignore(func_closing_bracket)
-    |> wrap()
     |> label("function call")
-    |> map({__MODULE__, :wrap, [:function_call]})
+    |> reduce({__MODULE__, :wrap, [:function_call]})
     |> debug()
+
+  if_expr =
+    string("?")
+    |> Base.ignore_ws()
+    |> concat(func_opening_bracket)
+    |> parsec(:comparison)
+    |> times(
+      ignore(func_args_separator)
+      |> parsec(:expression)
+      |> label("if arg"),
+      2
+    )
+    |> concat(func_closing_bracket)
+    |> post_traverse({:if_else, []})
+    |> label("if expression")
+
+  def if_else(_, [_, expr2, expr1, condition, _, "?"], context, _, _) do
+    node = %{
+      data: [function: "?"],
+      args: [condition, expr1, expr2]
+    }
+
+    {[node], context}
+  end
+
+  def if_else(_, [_, _, _, {"{", pos}, "?"], _, _, _) do
+    {:error, "no match for { at #{pos}"}
+  end
 
   expression_in_brackets =
     opening_bracket
@@ -90,7 +121,7 @@ defmodule Nimble do
     {[expr], context}
   end
 
-  def what_is_this(_rest, [_args, {paren, position}] = args, _, _, _) do
+  def what_is_this(_, [_, {paren, position}], _, _, _) do
     {:error, "no match for #{paren} at #{position}"}
   end
 
@@ -99,7 +130,8 @@ defmodule Nimble do
       number,
       variable,
       function_call,
-      expression_in_brackets
+      expression_in_brackets,
+      if_expr
     ])
     |> Base.ignore_ws()
     |> label("factor")
@@ -108,34 +140,33 @@ defmodule Nimble do
     :term,
     factor
     |> repeat(mul_div |> concat(factor))
-    |> wrap()
-    |> map({__MODULE__, :left_ass, []})
+    |> reduce({__MODULE__, :left_ass, []})
   )
 
   expr_start =
     empty()
     |> Base.ignore_ws()
-    |> lookahead_not(choice([any_operator, any_closing_bracket]))
+    |> lookahead_not(any_operator)
+    |> lookahead_not(any_closing_bracket)
 
   defparsec(
     :expression,
     expr_start
     |> parsec(:term)
     |> repeat(add_sub |> parsec(:term))
-    |> wrap()
-    |> map({__MODULE__, :left_ass, []})
+    |> reduce({__MODULE__, :left_ass, []})
   )
 
   defparsec(:full, parsec(:expression) |> eos())
 
   comparison_operator =
     choice([
-      string(">"),
-      string("<"),
-      string("="),
       string("<="),
       string(">="),
-      string("<>")
+      string("<>"),
+      string(">"),
+      string("<"),
+      string("=")
     ])
     |> Base.ignore_ws()
     |> label("comparison operator")
@@ -146,8 +177,7 @@ defmodule Nimble do
     |> concat(comparison_operator)
     |> parsec(:expression)
     |> lookahead_not(comparison_operator)
-    |> wrap()
-    |> map({__MODULE__, :wrap_comparison, []})
+    |> reduce({__MODULE__, :wrap_comparison, []})
   )
 
   def wrap_comparison([a, op, b]) do
@@ -173,34 +203,8 @@ defmodule Nimble do
     left_ass([new_a | rest])
   end
 
-  def wrap([a, op, b], :term) do
-    %{
-      data: [operator: op],
-      args: List.flatten([a, b])
-    }
-  end
-
-  def wrap([%{data: _}] = term, :term) do
-    term
-  end
-
-  def wrap(term, :term) when is_list(term) do
-    __MODULE__.wrap(List.flatten(term), :term)
-  end
-
-  def wrap(term, :term) do
-    term |> IO.inspect()
-  end
-
   def wrap(term, :integer), do: %{data: [integer: term]}
   def wrap(term, :variable), do: %{data: [variable: term]}
-
-  def wrap([a, op, b], :operator) do
-    %{
-      data: [operator: op],
-      args: [a, b]
-    }
-  end
 
   def wrap([func_name, args], :function_call) do
     %{
